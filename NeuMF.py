@@ -13,7 +13,7 @@ import keras
 from keras import backend as K
 from keras import initializers
 from keras.regularizers import l1, l2
-from keras.models import Sequential, Model
+from keras.models import Sequential, Model, load_model
 from keras.layers.core import Dense, Lambda, Activation
 from keras.layers import Embedding, Input, Dense, Multiply, Reshape, Flatten, Dropout, Concatenate
 from keras.optimizers import Adagrad, Adam, SGD, RMSprop
@@ -27,7 +27,7 @@ import argparse
 #################### Arguments ####################
 def parse_args():
     parser = argparse.ArgumentParser(description="Run NeuMF.")
-    parser.add_argument('--path', nargs='?', default='Data/',
+    parser.add_argument('--path', nargs='?', default=None,
                         help='Input data path.')
     parser.add_argument('--epochs', type=int, default=100,
                         help='Number of epochs.')
@@ -55,10 +55,13 @@ def parse_args():
                         help='Specify the pretrain model file for MF part. If empty, no pretrain will be used')
     parser.add_argument('--mlp_pretrain', nargs='?', default='',
                         help='Specify the pretrain model file for MLP part. If empty, no pretrain will be used')
+    parser.add_argument('--user_id', type=str, default=None,
+                        help='User id to generate recommendation')
+    parser.add_argument('--input_model', type=str, default=None,
+                        help='Path to the input model file')
+    parser.add_argument('--top', type=int, default=10,
+                        help='top N')
     return parser.parse_args()
-
-def init_normal(shape, name=None):
-    return initializers.normal(shape, scale=0.01, name=name)
 
 def get_model(num_users, num_items, mf_dim=10, layers=[10], reg_layers=[0], reg_mf=0):
     assert len(layers) == len(reg_layers)
@@ -155,83 +158,126 @@ def get_train_instances(train, num_negatives):
 
 if __name__ == '__main__':
     args = parse_args()
-    num_epochs = args.epochs
-    batch_size = args.batch_size
-    mf_dim = args.num_factors
-    layers = eval(args.layers)
-    reg_mf = args.reg_mf
-    reg_layers = eval(args.reg_layers)
-    num_negatives = args.num_neg
-    learning_rate = args.lr
-    learner = args.learner
-    verbose = args.verbose
-    mf_pretrain = args.mf_pretrain
-    mlp_pretrain = args.mlp_pretrain
-            
-    topK = 10
-    evaluation_threads = 1#mp.cpu_count()
-    print("NeuMF arguments: %s " %(args))
-    model_out_file = './NeuMF_%d_%s_%d.h5' %(mf_dim, args.layers, time())
 
-    # Loading data
-    t1 = time()
-    dataset = ED_Dataset(args.path)
-    train, testRatings, testNegatives = dataset.train_matrix, dataset.test_ratings, dataset.test_negatives
-    num_users, num_items = train.shape
-    print("Load data done [%.1f s]. #user=%d, #item=%d, #train=%d, #test=%d" 
-          %(time()-t1, num_users, num_items, train.nnz, len(testRatings)))
-    
-    # Build model
-    model = get_model(num_users, num_items, mf_dim, layers, reg_layers, reg_mf)
-    if learner.lower() == "adagrad": 
-        model.compile(optimizer=Adagrad(lr=learning_rate), loss='binary_crossentropy')
-    elif learner.lower() == "rmsprop":
-        model.compile(optimizer=RMSprop(lr=learning_rate), loss='binary_crossentropy')
-    elif learner.lower() == "adam":
-        model.compile(optimizer=Adam(lr=learning_rate), loss='binary_crossentropy')
+    if args.user_id is not None and args.input_model is not None and args.path is not None:
+        model = load_model(args.input_model)
+        dataset = ED_Dataset(args.path)
+        u = dataset.get_user_index(args.user_id)
+        num_items = dataset.num_items
+        users = np.full(num_items, u, dtype = 'int32')
+        predictions = model.predict([users, np.array(range(num_items))], 
+                                 batch_size=100, verbose=0)
+        pairs = [(i,r) for (i, r) in zip(range(num_items), predictions)]
+        pairs.sort(key = lambda x: x[1], reverse=True)
+
+        user_to_card = dataset.load_user_to_card()
+        touched_map = {card:True for card in user_to_card[args.user_id]}
+        cut = 100
+
+        pairs = pairs[:cut]
+        indices = [i for (i, _) in pairs]
+        details = dataset.get_cards_detail(indices)
+        j = 1
+        for i in range(len(details)):
+            s = ''
+            if details[i]['card_id'] in touched_map:
+                s = '(touched)'
+                # touched_list.append(details[i])
+                # rate_list.append(rate_map[indices[i]])
+            else:
+                s = '(selected for recommendation)'
+                print('%3d. %s %f title: %s' % (j, s, pairs[i][1], details[i]['title']))
+                # print(details[i])
+                # print(dataset.get_attributes(details[i]))
+                # ecl = details[i]['ecl_id']
+                # if ecl in ecl_to_skill:
+                #     print(f'skills: {ecl_to_skill[ecl]}')
+                
+                print('')
+                print('')
+                if j == args.top:
+                    break
+                j += 1
+        
     else:
-        model.compile(optimizer=SGD(lr=learning_rate), loss='binary_crossentropy')
-    
-    # Load pretrain model
-    if mf_pretrain != '' and mlp_pretrain != '':
-        gmf_model = GMF.get_model(num_users,num_items,mf_dim)
-        gmf_model.load_weights(mf_pretrain)
-        mlp_model = MLP.get_model(num_users,num_items, layers, reg_layers)
-        mlp_model.load_weights(mlp_pretrain)
-        model = load_pretrain_model(model, gmf_model, mlp_model, len(layers))
-        print("Load pretrained GMF (%s) and MLP (%s) models done. " %(mf_pretrain, mlp_pretrain))
-        
-    # Init performance
-    (hits, ndcgs) = evaluate_model(model, testRatings, testNegatives, topK, evaluation_threads)
-    hr, ndcg = np.array(hits).mean(), np.array(ndcgs).mean()
-    print('Init: HR = %.4f, NDCG = %.4f' % (hr, ndcg))
-    best_hr, best_ndcg, best_iter = hr, ndcg, -1
-    if args.out > 0:
-        model.save_weights(model_out_file, overwrite=True) 
-        
-    # Training model
-    for epoch in range(num_epochs):
-        t1 = time()
-        # Generate training instances
-        user_input, item_input, labels = get_train_instances(train, num_negatives)
-        
-        # Training
-        hist = model.fit([np.array(user_input), np.array(item_input)], #input
-                         np.array(labels), # labels 
-                         batch_size=batch_size, epochs=1, verbose=0, shuffle=True)
-        t2 = time()
-        
-        # Evaluation
-        if epoch %verbose == 0:
-            (hits, ndcgs) = evaluate_model(model, testRatings, testNegatives, topK, evaluation_threads)
-            hr, ndcg, loss = np.array(hits).mean(), np.array(ndcgs).mean(), hist.history['loss'][0]
-            print('Iteration %d [%.1f s]: HR = %.4f, NDCG = %.4f, loss = %.4f [%.1f s]' 
-                  % (epoch,  t2-t1, hr, ndcg, loss, time()-t2))
-            if hr > best_hr:
-                best_hr, best_ndcg, best_iter = hr, ndcg, epoch
-                if args.out > 0:
-                    model.save_weights(model_out_file, overwrite=True)
+        num_epochs = args.epochs
+        batch_size = args.batch_size
+        mf_dim = args.num_factors
+        layers = eval(args.layers)
+        reg_mf = args.reg_mf
+        reg_layers = eval(args.reg_layers)
+        num_negatives = args.num_neg
+        learning_rate = args.lr
+        learner = args.learner
+        verbose = args.verbose
+        mf_pretrain = args.mf_pretrain
+        mlp_pretrain = args.mlp_pretrain
+                
+        topK = 10
+        evaluation_threads = 1#mp.cpu_count()
+        print("NeuMF arguments: %s " %(args))
+        model_out_file = './NeuMF_%d_%s_%d.h5' %(mf_dim, args.layers, time())
 
-    print("End. Best Iteration %d:  HR = %.4f, NDCG = %.4f. " %(best_iter, best_hr, best_ndcg))
-    if args.out > 0:
-        print("The best NeuMF model is saved to %s" %(model_out_file))
+        # Loading data
+        t1 = time()
+        dataset = ED_Dataset(args.path)
+        train, testRatings, testNegatives = dataset.train_matrix, dataset.test_ratings, dataset.test_negatives
+        num_users, num_items = train.shape
+        print("Load data done [%.1f s]. #user=%d, #item=%d, #train=%d, #test=%d" 
+            %(time()-t1, num_users, num_items, train.nnz, len(testRatings)))
+        
+        # Build model
+        model = get_model(num_users, num_items, mf_dim, layers, reg_layers, reg_mf)
+        if learner.lower() == "adagrad": 
+            model.compile(optimizer=Adagrad(lr=learning_rate), loss='binary_crossentropy')
+        elif learner.lower() == "rmsprop":
+            model.compile(optimizer=RMSprop(lr=learning_rate), loss='binary_crossentropy')
+        elif learner.lower() == "adam":
+            model.compile(optimizer=Adam(lr=learning_rate), loss='binary_crossentropy')
+        else:
+            model.compile(optimizer=SGD(lr=learning_rate), loss='binary_crossentropy')
+        
+        # Load pretrain model
+        if mf_pretrain != '' and mlp_pretrain != '':
+            gmf_model = GMF.get_model(num_users,num_items,mf_dim)
+            gmf_model.load_weights(mf_pretrain)
+            mlp_model = MLP.get_model(num_users,num_items, layers, reg_layers)
+            mlp_model.load_weights(mlp_pretrain)
+            model = load_pretrain_model(model, gmf_model, mlp_model, len(layers))
+            print("Load pretrained GMF (%s) and MLP (%s) models done. " %(mf_pretrain, mlp_pretrain))
+            
+        # Init performance
+        (hits, ndcgs) = evaluate_model(model, testRatings, testNegatives, topK, evaluation_threads)
+        hr, ndcg = np.array(hits).mean(), np.array(ndcgs).mean()
+        print('Init: HR = %.4f, NDCG = %.4f' % (hr, ndcg))
+        best_hr, best_ndcg, best_iter = hr, ndcg, -1
+        if args.out > 0:
+            model.save_weights(model_out_file, overwrite=True) 
+            
+        # Training model
+        for epoch in range(num_epochs):
+            t1 = time()
+            # Generate training instances
+            user_input, item_input, labels = get_train_instances(train, num_negatives)
+            
+            # Training
+            hist = model.fit([np.array(user_input), np.array(item_input)], #input
+                            np.array(labels), # labels 
+                            batch_size=batch_size, epochs=1, verbose=0, shuffle=True)
+            t2 = time()
+            
+            # Evaluation
+            if epoch %verbose == 0:
+                (hits, ndcgs) = evaluate_model(model, testRatings, testNegatives, topK, evaluation_threads)
+                hr, ndcg, loss = np.array(hits).mean(), np.array(ndcgs).mean(), hist.history['loss'][0]
+                print('Iteration %d [%.1f s]: HR = %.4f, NDCG = %.4f, loss = %.4f [%.1f s]' 
+                    % (epoch,  t2-t1, hr, ndcg, loss, time()-t2))
+                if hr > best_hr:
+                    best_hr, best_ndcg, best_iter = hr, ndcg, epoch
+                    if args.out > 0:
+                        # model.save_weights(model_out_file, overwrite=True)
+                        model.save(model_out_file, overwrite=True)
+
+        print("End. Best Iteration %d:  HR = %.4f, NDCG = %.4f. " %(best_iter, best_hr, best_ndcg))
+        if args.out > 0:
+            print("The best NeuMF model is saved to %s" %(model_out_file))
