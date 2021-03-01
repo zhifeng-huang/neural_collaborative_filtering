@@ -12,11 +12,11 @@ import theano
 import theano.tensor as T
 import keras
 from keras import backend as K
-from keras import initializations
-from keras.regularizers import l2, activity_l2
-from keras.models import Sequential, Graph, Model
+from keras import initializers
+from keras.regularizers import l2
+from keras.models import Sequential, Model
 from keras.layers.core import Dense, Lambda, Activation
-from keras.layers import Embedding, Input, Dense, merge, Reshape, Merge, Flatten, Dropout
+from keras.layers import Embedding, Input, Dense, Reshape, Flatten, Dropout, Concatenate
 from keras.constraints import maxnorm
 from keras.optimizers import Adagrad, Adam, SGD, RMSprop
 from evaluate import evaluate_model
@@ -54,7 +54,7 @@ def parse_args():
     return parser.parse_args()
 
 def init_normal(shape, name=None):
-    return initializations.normal(shape, scale=0.01, name=name)
+    return initializers.normal(shape, scale=0.01, name=name)
 
 def get_model(num_users, num_items, layers = [20,10], reg_layers=[0,0]):
     assert len(layers) == len(reg_layers)
@@ -73,7 +73,7 @@ def get_model(num_users, num_items, layers = [20,10], reg_layers=[0,0]):
     item_latent = Flatten()(MLP_Embedding_Item(item_input))
     
     # The 0-th layer is the concatenation of embedding layers
-    vector = merge([user_latent, item_latent], mode = 'concat')
+    vector = Concatenate()([user_latent, item_latent])
     
     # MLP layers
     for idx in xrange(1, num_layer):
